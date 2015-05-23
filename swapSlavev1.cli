@@ -1,0 +1,306 @@
+<?
+/**
+Author: Peter G Colclough
+Date  : 20 May 2015
+Version: 1.0
+Description: 
+Procedure to swap a slave from one master to another. Assumes:
+     1. The two machines are linked as a Master/Slave or Dual Master (which is, both are a slave of each other). 
+     2. Both machines are generating replication logs.
+     3. The slave to be moved is currently linked to one of the master machines.
+
+To Do: 
+     1. Check that slave is currently linked to one of teh provided masters
+     2. Check that a 1620 error has not been generated after the switch, and if so, issue :
+              Stop Slave; SET GLOBAL sql_slave_skip_counter = 1; Start Slave;
+        Unti teh error has gone.
+     3. Put functions into class methods.
+
+Instructions:
+     1. Add in an Admin Userid/Pwd and your Replciation Userid / Password i teh fisrt 4 variables at the top of this code.
+     2. Call in a Terminal  by : 
+          ssh> /path/to/php swapSlaveV1.cli [Slave_Name] [Master1] [MasterII] 
+*/
+/**     
+Process: (Assumes masterFrom and masterTo are linked to each other as master / slave)
+      1. para 1 = slave
+              2 = masterFrom
+              3 = masterTo
+              These last two can be either way around, as the code works out which way to swap.
+      2. Connect to all 3 servers with config user (admin rights)
+         Get all 3 serverIds (show variables like server_id;)
+      3. Find out which master is a slave and which a master by checking the Master_Server_Id in 'show slave status';
+*/
+$suid     = [Admin Userid];
+$spwd     = [Admin Pwd];
+$sReplUid = [Replication Uid];
+$sReplPwd = [Replication Pwd];
+$nport    = [Port #.. ususally 3306];
+$slave    = '';         // The slave to move
+$masterFrom = '';       // Move teh
+$aServers = array();
+/**
+  1. Get DBs and their relevant information
+
+*/
+while (true){
+  if($argc >= 4){
+    $aServers['slave']      = array('server' => $argv[1], 'link' => '', 'server_id' => 0, 'master' => '');
+    $aServers['masterI'] = array('server' => $argv[2], 'link' => '', 'server_id' => 0, 'master' => '');
+    $aServers['masterII']  = array('server' => $argv[3], 'link' => '', 'server_id' => 0, 'master' => '');
+  } else {
+    echo("Not enough Paras\n");
+    exit;
+  }
+  /**
+    Slave details got from Command Line Now connect and get IDs
+  */
+  $aServers = getServerDetails($aServers, $suid, $spwd, $nport);
+  /**
+  Find out which master is master and which is slave...and which one slave attached to
+  */
+  $aMasterFrom = array();
+  $aMasterTo   = array();
+  $nSlaveId = $aServers['slave']['server_id'];
+
+  if($aServers['masterI']['master'] == $aServers['masterII']['server_id']){
+    $aMasterSlave = $aServers['masterI'];
+    $aMasterMaster = $aServers['masterII'];
+  } else {
+    if( $aServers['masterII']['master'] == $aServers['masterI']['server_id']) {
+     $aMasterSlave = $aServers['masterII'];
+      $aMasterMaster = $aServers['masterI'];
+    } else {
+      $aMasterSlave = array();
+      $aMasterMaster= array();
+    }
+  }
+
+  if($aServers['slave']['master'] == $aServers['masterI']['server_id']){
+    $aMasterFrom = $aServers['masterI'];
+    $aMasterTo   = $aServers['masterII'];
+  } else {
+    if($aServers['slave']['master'] == $aServers['masterII']['server_id']){
+      $aMasterFrom = $aServers['masterII'];
+      $aMasterTo   = $aServers['masterI'];
+    } else {
+      $aMasterFrom = array();
+      $aMasterTo = array();
+    }
+  }
+
+  if(!empty($aMasterMaster) && !empty($aMasterSlave) && !empty($aMasterFrom) && !empty($aMasterTo)){
+    echo('Moving Slave '.$aServers['slave']['server_id'].' from '.$aMasterFrom['server_id'].' to '.$aMasterTo['server_id']."\n");
+    $bOk = moveMaster($aServers['slave'], $aMasterFrom, $aMasterTo, $aMasterMaster, $aMasterSlave,$sReplUid, $sReplPwd);
+  } else {
+    echo("Issue between masters and slaves, operation cant continue\n");
+  }
+
+  // Close Links
+ foreach($aServers as $key=>$server){
+   $server['link']->close();
+ }
+
+  exit;
+}
+
+/**
+ Functions
+ getServerDetails() -- Get the server IDs and the Links
+ moveMaster()       -- Move the slave from one master to the other
+ stopSlave()        -- Stop a machine
+ startSlave()       -- Start a Machine
+ getSlaveStatus     -- get the Slave Status array
+ getHostDetails     -- Get the host name and port
+ getMasterStatus    -- Get the Master Status
+*/
+function getServerDetails($aServers, $spUid, $spPwd, $npPort){
+   $sql = "show variables like 'server_id'";
+   $sqlSlave = 'show slave status';
+  foreach($aServers as $key=>$server){
+     if(($aServers[$key]['link'] = mysqli_connect($server['server'], $spUid, $spPwd, '', $npPort)) == true){
+        if($qry = $aServers[$key]['link']->query($sql)){
+           $aRet = $qry->fetch_assoc();
+           $aServers[$key]['server_id'] = $aRet['Value'];
+           // Slave status
+           $aRet = getSlaveStatus($aServers[$key]);          // Need this as the copy does not ahve teh link in it
+           if(!empty($aRet)){
+              $aServers[$key]['master'] = $aRet['Master_Server_Id'];
+           }
+        }
+     }
+  }
+  return $aServers;
+}
+
+function moveMaster($apSlave, $apFromMaster, $apToMaster, $apMasterMaster, $apMasterSlave,$spuid, $sppwd){
+   $readSql  = 'Show Slave Status';
+   $aSlaveVals = array();
+   $aMSVals = array();
+   $sChangeSql = 'CHANGE MASTER TO MASTER_HOST=\'%s\', MASTER_USER=\'%s\', MASTER_PASSWORD=\'%s\', MASTER_LOG_FILE=\'%s\', MASTER_LOG_POS=%s, MASTER_PORT=%s';
+   $bRet = false;
+   // Get values to read
+   $sMaster = '';
+   $nPort   = '';
+      $nPort   = '';
+   $sFile = '';
+   $nPort = -1;
+   $bSwapToTop = false;
+   /**
+    We need to work out how to get the right master details. Different ways if the master we are swapping to is at the top of the tree or not
+    1. Get hostname and port.. same for all types
+   */
+   $aToMasterDets = getHostDetails($apToMaster);
+   $sMaster = $aToMasterDets['hostname'];
+   $nPort   = $aToMasterDets['port'];
+
+   if($apToMaster['server_id'] == $apMasterMaster['server_id']){       // we are swapping to the top of the tree
+      $bSwapToTop = true;                                               // Different depending on whether we are at the top of teh tree.. or a slaveMaster
+   }
+
+
+   // Stop io_threads on MasterSlave
+   if(stopSlave($apMasterSlave)){
+     $aMSVals = getSlaveStatus($apMasterSlave);
+
+     if($bSwapToTop){                                    // Check against the Actual Slave
+        $aSlaveVals = getSlaveStatus($apSlave);         // Get current status on slave
+        $thisMasterExec = $aSlaveVals['Exec_Master_Log_Pos'];
+        // Now we need to check that the MasterSlave has stopped receiving from the MasterMaster
+        echo("Waiting for Master Slave to stop\n");
+        while(true){
+          echo('.');
+          $aVals = getSlaveStatus($apSlave);
+          if($aVals['Exec_Master_Log_Pos'] != $thisMasterExec){
+            $thisMasterExec = $aVals['Exec_Master_Log_Pos'];
+          } else {
+            // The slave has received all data..so stop it
+            stopSlave($apSlave);
+            break;
+          }
+        } // End while (true)
+      } else {                                         // Swap from top to bottom
+        /**
+        Here we do the following:
+        1. slave>stop slave
+        1a. wait 1s
+        2. mslave>stop slave
+        3. get mSlave log position
+        4. slave>start slave until master_log_file= .... , master_log_pos=nnnn
+        5. change master to ......
+        */
+        stopSlave($apSlave);             // 1. Stop slave
+        sleep(1);
+        stopSlave($apMasterSlave);       // 2. Stop Master Slave
+        $apMSDets = getSlaveStatus($apMasterSlave);
+        $sql = "start slave until MASTER_LOG_FILE='".$apMSDets['Master_Log_File']."', MASTER_LOG_POS=".$apMSDets['Exec_Master_Log_Pos'];
+        $apSlave['link']->query($sql);
+        stopSlave($apSlave);
+      }
+      echo("Stopped\n");
+
+      /**
+         Slave Stopped.. MasterSlave Stopped
+      */
+      $aToMaster = getSlaveStatus($apToMaster);
+      // Get values to read
+      /**
+        Get the filenames and positions either from the MasterSlave details or teh mastermaster Master Status details
+        1. If we are swapping from the MasterSlave to the MasterMaster , then we can get the values for teh new master
+           from the 'show slave status' values got from getSlaveStatus();
+        2. If we are swapping from the MasterMaster to teh MasterSlave then we need to get the values from
+           'show master status' got from getMasterStatus()
+        In both cases the MasterSlave is stopped when we get this information.
+      */
+      if($bSwapToTop){
+        $aVals = getSlaveStatus($apMasterSlave);
+        $sFile = $aVals['Master_Log_File'];
+        $nPos  = $aVals['Exec_Master_Log_Pos'];
+      } else {
+        $aVals = getMasterStatus($apMasterSlave);
+        $sFile = $aVals['File'];
+        $nPos  = $aVals['Position'];
+      }
+
+      $sql     = sprintf($sChangeSql, $sMaster, $spuid, $sppwd, $sFile, $nPos, $nPort);
+      /************************************************
+       Execute here.. after first stopping the slave completely
+      ************************************************/
+      stopSlave($apSlave, false);
+
+      if($qry = $apSlave['link']->query($sql)){
+        echo("Slave Swapped\n");
+      } else {
+        echo("*** Failed to Swap Slave ***\n");
+        echo("Error: [".$apSlave['link']->errno."] ".$apSlave['link']->error."\n");
+      }
+   }
+
+   //Restart just in case
+   startSlave($apMasterSlave);
+   startSlave($apSlave);
+   return $bRet;
+}
+// Function to stop slave
+function stopSlave($apServer,$bponlyIO = true){
+  if($bponlyIO){
+     $sql = 'stop slave io_thread';
+  } else {
+     $sql = 'stop slave';
+  }
+  $bRes = false;
+  if(!empty($apServer)){
+    if($qry =  $apServer['link']->query($sql)){
+      echo('Stopped Slave on '.$apServer['server_id']."\n");
+      $bRes = true;
+    }
+  }
+  return $bRes;
+}
+// Function to start slave
+function startSlave($apServer){
+  $sql = 'start slave';
+  $bRes = false;
+  if(!empty($apServer)){
+    if($qry =  $apServer['link']->query($sql)){
+      echo('Started Slave on '.$apServer['server_id']."\n");
+      $bRes = true;
+    }
+  }
+  return $bRes;
+}
+// Function to get server status
+function getSlaveStatus($apServer){
+  $sql = 'show slave status';
+  $aRes = array();
+  if(!empty($apServer)){
+    if($qry =  $apServer['link']->query($sql)){
+      $aRes = $qry->fetch_assoc();
+    }
+  }
+  return $aRes;
+}
+// Function to get Host name/Port
+function getHostDetails($apHost = array()){
+  $sql = "show variables where Variable_name in( 'hostname','port')";
+  $aRet = array();
+  if($qry = $apHost['link']->query($sql)){
+     while($aRows[] = $qry->fetch_assoc()){
+           ;
+     }
+     foreach($aRows as $key=>$value){
+       $aRet[$value['Variable_name']] = $value['Value'];
+     }
+  }
+  return $aRet;
+}
+//Function getMasterStatus
+function getMasterStatus($apHost = array()){
+  $sql = "show master status";
+  $aRet = array();
+  if($qry = $apHost['link']->query($sql)){
+     $aRet = $qry->fetch_assoc();
+  }
+  return $aRet;
+}
+                                           
